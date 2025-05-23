@@ -1,6 +1,6 @@
 # Copyright (c) 2024-2025 iiPython
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # Modules
 import shlex
@@ -9,12 +9,20 @@ from pathlib import Path
 
 import click
 import uvicorn
-from tqdm import tqdm
-from rich.console import Console
 from fastapi import FastAPI, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from requests import Session
 from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
+
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    TextColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+)
 
 # Initialization
 console = Console()
@@ -56,6 +64,7 @@ def serve(host: str, port: int, path: Path) -> None:
         if not file_path.relative_to(path):
             return JSONResponse({"code": 403}, status_code = 403)
 
+        file_path.parent.mkdir(parents = True, exist_ok = True)
         with file_path.open("wb") as handle:
             shutil.copyfileobj(file.file, handle)
 
@@ -72,9 +81,20 @@ def serve(host: str, port: int, path: Path) -> None:
 @click.argument("host")
 def connect(host: str) -> None:
     url = f"{'http://' if '://' not in host else ''}{host.rstrip('/')}/api"
+
+    # Create rich progress
+    progress = Progress(
+        TextColumn("[bold blue]{task.fields[filename]}"),
+        BarColumn(bar_width = None),
+        "[progress.percentage]{task.percentage:>3.1f}%",
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        TimeRemainingColumn(),
+    )
+
     session, block_size = Session(), 1024 ** 2
     while True:
-        match shlex.split(input(f"[{url.split('://')[1].split(':')[0]}] $ ")):
+        match shlex.split(console.input(f"[blue]\\[{url.split('://')[1].split(':')[0]}] [green]$ ")):
             case ["ls", *args]:
                 response = session.get(f"{url}/glob/{args[0] if args else '.'}/*", params = {"ls": "yes"}).json()
                 print(*response["data"])
@@ -90,6 +110,7 @@ def connect(host: str) -> None:
                     if not response:
                         response = session.get(f"{url}/glob/{glob}/**").json()["data"]
 
+                progress.start()
                 try:
                     for file in response:
                         file = parent / Path(file)
@@ -101,19 +122,11 @@ def connect(host: str) -> None:
                         # Handle progress bar
                         response = session.get(f"{url}/download/{file.relative_to(parent)}", stream = True)
                         try:
-                            with tqdm(
-                                desc = file.name,
-                                total = int(response.headers.get("content-length", 0)),
-                                unit = "B",
-                                unit_scale = True,
-                                unit_divisor = 1024
-                            ) as bar:
-                                with file.open("wb") as fh:
-                                    for data in response.iter_content(block_size):
-                                        bar.update(len(data))
-                                        fh.write(data)
-
-                                bar.update(block_size)
+                            task = progress.add_task("download", filename = file.name, total = int(response.headers.get("content-length", 0)))
+                            with file.open("wb") as fh:
+                                for data in response.iter_content(block_size):
+                                    progress.update(task, advance = len(data))
+                                    fh.write(data)
 
                         except PermissionError:
                             pass
@@ -121,35 +134,37 @@ def connect(host: str) -> None:
                 except KeyboardInterrupt:
                     print("Aborted!")
 
+                progress.stop()
+
             case ["upload", *globs]:
+                progress.start()
+
                 def upload_file(path: Path, relative: str) -> None:
-                    with tqdm(
-                        desc = path.name,
-                        total = path.stat().st_size,
-                        unit = "B",
-                        unit_scale = True,
-                        unit_divisor = 1024,
-                    ) as bar:
-                        with path.open("rb") as fh:
-                            e = MultipartEncoder(fields = {"file": ("filename", fh)})
-                            m = MultipartEncoderMonitor(
-                                e, lambda monitor: bar.update(monitor.bytes_read - bar.n)
-                            )
-                            session.post(f"{url}/upload/{relative}", data = m, headers = {"Content-Type": m.content_type})
+                    task = progress.add_task("download", filename = path.name, total = path.stat().st_size)
+                    with path.open("rb") as fh:
+                        e = MultipartEncoder(fields = {"file": ("filename", fh)})
+                        m = MultipartEncoderMonitor(
+                            e, lambda monitor: progress.update(task, completed = monitor.bytes_read)
+                        )
+                        session.post(f"{url}/upload/{relative}", data = m, headers = {"Content-Type": m.content_type})
 
-                for path in [Path(x).expanduser() for x in globs]:
-                    if path.is_file():
-                        upload_file(path.absolute(), path.name)
+                for glob in globs:
+                    for item in Path().glob(glob):
+                        if item.is_dir():
+                            for file in item.rglob("*"):
+                                if not file.is_file():
+                                    continue
 
-                    else:
-                        for file in path.rglob("*"):
-                            print(file)
-                            if file.is_file():
-                                upload_file(file.absolute(), str(file.relative_to(path)))
+                                upload_file(file.absolute(), str(file))
+
+                        else:
+                            upload_file(item.absolute(), item.name)
+
+                progress.stop()
 
             case ["help"]:
-                print(f"iiPython RFS v{__version__} -- {url}")
-                print("Commands: help, ls, download, upload, exit")
+                console.print(f"\n\t[bold]iiPython RFS [blue]v{__version__}[/]\n\t    --> Connected to [yellow]{url}\n")
+                console.print("\t[bold]Commands:[/] [magenta]help, ls, download, upload, exit\n")
 
             case ["exit"]:
                 break
